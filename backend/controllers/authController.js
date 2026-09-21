@@ -7,6 +7,8 @@ const { createAuditLog } = require("../services/auditService");
 // REGISTER
 // ======================================================
 const register = async (req, res) => {
+  let connection;
+
   try {
     const {
       name,
@@ -28,9 +30,6 @@ const register = async (req, res) => {
 
     // --------------------------------------------------
     // Normalize role
-    //
-    // USER is the normal Life Link account.
-    // A USER can both request and donate blood.
     // --------------------------------------------------
     const requestedRole = role
       ? String(role).trim().toUpperCase()
@@ -38,8 +37,6 @@ const register = async (req, res) => {
 
     // --------------------------------------------------
     // Public registration roles
-    //
-    // ADMIN is intentionally NOT allowed here.
     // --------------------------------------------------
     const allowedRoles = [
       "USER",
@@ -85,9 +82,19 @@ const register = async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     // --------------------------------------------------
+    // Get database connection
+    // --------------------------------------------------
+    connection = await pool.getConnection();
+
+    // --------------------------------------------------
+    // Start transaction
+    // --------------------------------------------------
+    await connection.beginTransaction();
+
+    // --------------------------------------------------
     // Create user
     // --------------------------------------------------
-    const [result] = await pool.query(
+    const [result] = await connection.query(
       `
       INSERT INTO users
       (
@@ -109,11 +116,48 @@ const register = async (req, res) => {
       ]
     );
 
+    const userId = result.insertId;
+
+    // --------------------------------------------------
+    // Create Blood Bank profile automatically
+    // --------------------------------------------------
+    if (requestedRole === "BLOOD_BANK") {
+      await connection.query(
+        `
+        INSERT INTO blood_banks
+        (
+          user_id,
+          bank_name,
+          phone,
+          email
+        )
+        VALUES (?, ?, ?, ?)
+        `,
+        [
+          userId,
+          String(name).trim(),
+          phone ? String(phone).trim() : null,
+          normalizedEmail
+        ]
+      );
+    }
+
+    // --------------------------------------------------
+    // Commit transaction
+    // --------------------------------------------------
+    await connection.commit();
+
+    // --------------------------------------------------
+    // Release connection
+    // --------------------------------------------------
+    connection.release();
+    connection = null;
+
     // --------------------------------------------------
     // Audit log
     // --------------------------------------------------
     await createAuditLog({
-      user_id: result.insertId,
+      user_id: userId,
       action: "REGISTER",
       description: `User registered with role ${requestedRole}`
     });
@@ -125,7 +169,7 @@ const register = async (req, res) => {
       success: true,
       message: "Registration successful",
       user: {
-        user_id: result.insertId,
+        user_id: userId,
         name: String(name).trim(),
         email: normalizedEmail,
         phone: phone ? String(phone).trim() : null,
@@ -134,6 +178,19 @@ const register = async (req, res) => {
     });
 
   } catch (error) {
+    // --------------------------------------------------
+    // Rollback if something failed
+    // --------------------------------------------------
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("Rollback error:", rollbackError);
+      }
+
+      connection.release();
+    }
+
     console.error("Registration error:", error);
 
     res.status(500).json({
